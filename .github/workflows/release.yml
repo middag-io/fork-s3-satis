@@ -1,0 +1,214 @@
+name: Release
+
+# Em tag v* (ex.: v0.3.0), compila o s3-satis.phar e publica no R2 público.
+# O GitHub Release continua sendo cortado, mas SÓ como changelog: o artefato
+# não vai mais junto dele.
+#
+# CANAL ÚNICO DE DISTRIBUIÇÃO = R2, mesmo padrão do `middagctl`. Dois canais
+# para o mesmo artefato divergem: o do Release não tem manifest nem verificação
+# de sha256, e nada garante que as duas cópias sejam o mesmo byte. O consumidor
+# (`infra-privatesatis`) também deixa de precisar de `gh` e de token para baixar.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build PHAR + publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # PHP 8.4 é piso, não preferência: `composer/satis` dev-main exige
+      # `php: ^8.4`, e é dele que vem o `composer/composer` >= 2.10 — a versão
+      # que removeu a validação de charset do `github-oauth` e destravou os
+      # installation tokens do GitHub App que contêm hífen.
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+          tools: composer
+
+      - name: Derive version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate composer files
+        run: composer validate --strict --no-check-all
+
+      # `--no-dev` não é otimização: com as dev deps instaladas, o `laravel/pint`
+      # (22 MB) entra no PHAR e ele triplica de tamanho.
+      - name: Install dependencies (no-dev)
+        run: composer install --no-dev --prefer-dist --no-progress --no-interaction
+
+      - name: Build PHAR
+        run: |
+          php s3-satis app:build --build-version="${{ steps.v.outputs.version }}" --no-interaction
+          mv builds/s3-satis builds/s3-satis.phar
+          ls -l builds/s3-satis.phar
+
+      - name: Smoke
+        env:
+          VER: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          got="$(php builds/s3-satis.phar --version)"
+          echo "$got"
+          test "$got" = "S3 Satis Exporter $VER"
+
+          # O `build` do satis morre na primeira linha se o Composer embutido
+          # recusar o `config.github-oauth` — e ele recusava qualquer token com
+          # hífen até a 2.10.0. Como o job fica verde nesse cenário (o satis roda
+          # com `--skip-errors`), o índice congelava em silêncio. Este teste é a
+          # trava que impede um PHAR com Composer < 2.10 de sair daqui.
+          cat > /tmp/tok-test.php <<'PHP'
+          <?php
+          require 'phar://'.$argv[1].'/vendor/autoload.php';
+          $config = new Composer\Config(false);
+          $config->merge(['config' => ['github-oauth' => ['github.com' => 'ghs_15abc-def_GHI.jkl']]]);
+          (new Composer\IO\NullIO())->loadConfiguration($config);
+          echo "ok\n";
+          PHP
+          php /tmp/tok-test.php "$PWD/builds/s3-satis.phar" \
+            || { echo "::error::o Composer embutido recusa token com hífen — PHAR inutilizável para GitHub App" >&2; exit 1; }
+
+          php -r '
+            $s = file_get_contents("phar://".$argv[1]."/vendor/composer/composer/src/Composer/Composer.php");
+            preg_match("/VERSION = \x27([^\x27]+)/", $s, $m);
+            $v = $m[1] ?? "?";
+            echo "Composer embutido: $v\n";
+            if (version_compare($v, "2.10.0", "<")) {
+              fwrite(STDERR, "::error::Composer embutido $v < 2.10.0\n");
+              exit(1);
+            }
+          ' "$PWD/builds/s3-satis.phar"
+
+      - name: Publish Release (changelog only)
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+
+      # ── R2 público (middag-public) ────────────────────────────────────────
+      - name: Guarda de imutabilidade — versão já publicada?
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          VER: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Consulta a API, não o domínio público: o CDN cacheia e um 404 cacheado
+          # deixaria a guarda passar em cima de uma versão que existe.
+          if npx --yes wrangler@4 r2 object get \
+               "middag-public/s3-satis/${VER}/s3-satis.phar" \
+               --file /tmp/already-there --remote >/dev/null 2>&1; then
+            echo "::error::s3-satis ${VER} já está publicado no R2. Versão publicada é IMUTÁVEL — suba uma nova tag." >&2
+            exit 1
+          fi
+          echo "s3-satis ${VER} ainda não existe no bucket — ok para publicar."
+
+      - name: Monta o manifest (existente + versão nova)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          VER: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha256sum builds/s3-satis.phar | cut -d' ' -f1 > builds/s3-satis.phar.sha256
+          echo "sha256: $(cat builds/s3-satis.phar.sha256)"
+
+          if npx --yes wrangler@4 r2 object get "middag-public/s3-satis/manifest.json" \
+               --file /tmp/manifest-old.json --remote >/dev/null 2>&1; then
+            echo "Manifest atual baixado."
+          else
+            # `get` falha igual para "não existe" e para "credencial ruim". Sem
+            # distinguir os dois, um erro de auth publicaria um manifest com UMA
+            # versão e apagaria o histórico — todo consumidor pinado numa versão
+            # antiga deixaria de resolver. A listagem prova que a credencial serve.
+            npx --yes wrangler@4 r2 bucket list >/dev/null \
+              || { echo "::error::Credencial Cloudflare não funciona — abortando antes de reescrever o manifest." >&2; exit 1; }
+            echo "Bucket acessível e sem manifest — primeira publicação."
+            echo '{"schema":1,"tool":"s3-satis","latest":null,"versions":{}}' > /tmp/manifest-old.json
+          fi
+
+          python3 - "$VER" /tmp/manifest-old.json builds/s3-satis.phar > /tmp/manifest.json <<'PY'
+          import datetime, hashlib, json, sys
+
+          ver, old_path, artifact = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          with open(old_path, encoding="utf-8") as fh:
+              m = json.load(fh)
+          m.setdefault("schema", 1)
+          m.setdefault("tool", "s3-satis")
+          versions = m.setdefault("versions", {})
+
+          # Segunda trava, agora sobre o manifest: a primeira olha o objeto no
+          # bucket. As duas juntas cobrem manifest e artefato fora de sincronia.
+          if ver in versions:
+              sys.exit("versão %s já consta no manifest — publicação imutável" % ver)
+
+          with open(artifact, "rb") as fh:
+              data = fh.read()
+
+          versions[ver] = {
+              "path": "s3-satis/%s/s3-satis.phar" % ver,
+              "sha256": hashlib.sha256(data).hexdigest(),
+              "size": len(data),
+              "published_at": datetime.datetime.now(datetime.timezone.utc)
+                  .strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+
+          # `latest` é o que está saindo agora. Republicar tag antiga não acontece
+          # (a guarda de imutabilidade barra), então não há como andar para trás.
+          m["latest"] = ver
+          json.dump(m, sys.stdout, indent=2, sort_keys=True)
+          sys.stdout.write("\n")
+          PY
+
+          cat /tmp/manifest.json
+
+      - name: Publica no R2 (artefato → sha256 → manifest)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          VER: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Ordem importa: o manifest é o PONTEIRO. Subi-lo antes do artefato abre
+          # uma janela em que um consumidor resolve versão que ainda dá 404.
+          npx --yes wrangler@4 r2 object put "middag-public/s3-satis/${VER}/s3-satis.phar" \
+            --file builds/s3-satis.phar \
+            --content-type application/octet-stream \
+            --cache-control "public, max-age=31536000, immutable" \
+            --remote
+
+          npx --yes wrangler@4 r2 object put "middag-public/s3-satis/${VER}/s3-satis.phar.sha256" \
+            --file builds/s3-satis.phar.sha256 \
+            --content-type text/plain \
+            --cache-control "public, max-age=31536000, immutable" \
+            --remote
+
+          npx --yes wrangler@4 r2 object put "middag-public/s3-satis/manifest.json" \
+            --file /tmp/manifest.json \
+            --content-type application/json \
+            --cache-control "public, max-age=300" \
+            --remote
+
+          echo "Publicado: https://s3-middag-public.middag.com.br/s3-satis/${VER}/s3-satis.phar"
+
+      - name: Verifica pela URL pública
+        env:
+          VER: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          base="https://s3-middag-public.middag.com.br/s3-satis"
+          # O objeto de versão é novo, então não há cache de CDN para atrapalhar.
+          curl -fsSL "${base}/${VER}/s3-satis.phar" -o /tmp/pub-s3-satis.phar
+          got="$(sha256sum /tmp/pub-s3-satis.phar | cut -d' ' -f1)"
+          want="$(cat builds/s3-satis.phar.sha256)"
+          test "$got" = "$want" || { echo "::error::sha do artefato publicado difere do build ($got != $want)" >&2; exit 1; }
+          test "$(php /tmp/pub-s3-satis.phar --version)" = "S3 Satis Exporter ${VER}"
+          echo "Artefato público confere e executa."

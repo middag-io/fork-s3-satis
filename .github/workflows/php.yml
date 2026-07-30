@@ -1,62 +1,87 @@
 name: Build PHAR Archive
 
+# CI de branch e PR: compila o PHAR e guarda como artifact, para inspeção.
+# Publicação é do `release.yml`, disparado por tag `v*` — aqui não se publica
+# nada. Antes os dois viviam neste arquivo e a tag caía nos dois caminhos.
 on:
-  # Triggers the workflow on push or pull request events but only for the main branch
   push:
-    branches: [ master, develop ]
-    # Publish semver tags as releases.
-    tags: [ 'v*.*.*', 'v*.*', 'v*' ]
+    branches: [master, develop]
   pull_request:
-    branches: [ master, develop ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    branches: [master, develop]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build-phar:
-
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
 
+      # PHP 8.4 é piso, não preferência: `composer/satis` dev-main exige
+      # `php: ^8.4`, e é dele que vem o `composer/composer` >= 2.10 — a versão
+      # que removeu a validação de charset do `github-oauth`.
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.2'
+          php-version: '8.4'
+          coverage: none
+          tools: composer
 
       - name: Validate composer.json and composer.lock
         run: composer validate --strict --no-check-all
 
       - name: Cache Composer packages
-        id: composer-cache
-        uses: actions/cache@v3
+        uses: actions/cache@v5
         with:
           path: vendor
-          key: ${{ runner.os }}-php-${{ hashFiles('**/composer.lock') }}
+          key: ${{ runner.os }}-php84-${{ hashFiles('**/composer.lock') }}
           restore-keys: |
-            ${{ runner.os }}-php-
+            ${{ runner.os }}-php84-
 
-      - name: Install dependencies
-        run: composer install --prefer-dist --no-progress --no-dev
+      # `--no-dev` reproduz o que o release faz: com dev deps o `laravel/pint`
+      # (22 MB) entra no PHAR e ele triplica de tamanho. Buildar diferente do
+      # release esconderia justamente esse tipo de divergência.
+      - name: Install dependencies (no-dev)
+        run: composer install --no-dev --prefer-dist --no-progress --no-interaction
 
-      # Add a test script to composer.json, for instance: "test": "vendor/bin/phpunit"
-      # Docs: https://getcomposer.org/doc/articles/scripts.md
+      - name: Build PHAR
+        run: |
+          php s3-satis app:build --build-version="$(git rev-parse --short "$GITHUB_SHA")" --no-interaction
+          mv builds/s3-satis builds/s3-satis.phar
+          ls -l builds/s3-satis.phar
 
-      - name: Get the tag name
-        if:   startsWith(github.ref, 'refs/tags/')
-        run:  echo "TAG=${GITHUB_REF/refs\/tags\//}" >> $GITHUB_ENV
+      - name: Smoke — Composer embutido aceita token com hífen
+        run: |
+          set -euo pipefail
+          # O `build` do satis morre na primeira linha se o Composer embutido
+          # recusar o `config.github-oauth`, e ele recusava qualquer token com
+          # hífen até a 2.10.0. Como o satis roda com `--skip-errors`, o job do
+          # consumidor ficava VERDE nesse cenário e o índice congelava em
+          # silêncio. Esta trava impede a regressão voltar num bump de dep.
+          cat > /tmp/tok-test.php <<'PHP'
+          <?php
+          require 'phar://'.$argv[1].'/vendor/autoload.php';
+          $config = new Composer\Config(false);
+          $config->merge(['config' => ['github-oauth' => ['github.com' => 'ghs_15abc-def_GHI.jkl']]]);
+          (new Composer\IO\NullIO())->loadConfiguration($config);
+          echo "ok\n";
+          PHP
+          php /tmp/tok-test.php "$PWD/builds/s3-satis.phar" \
+            || { echo "::error::o Composer embutido recusa token com hífen — PHAR inutilizável para GitHub App" >&2; exit 1; }
 
-      - name: Build PHAR archive
-        if:   startsWith(github.ref, 'refs/tags/')
-        run: php s3-satis app:build --build-version=${{ env.TAG }}
-
-      - name: Build PHAR archive
-        if:   ${{ !startsWith(github.ref, 'refs/tags/') }}
-        run: php s3-satis app:build --build-version=$(git rev-parse --short "$GITHUB_SHA")
-
-      - name: Rename phar
-        run: mv builds/s3-satis builds/s3-satis.phar
+          php -r '
+            $s = file_get_contents("phar://".$argv[1]."/vendor/composer/composer/src/Composer/Composer.php");
+            preg_match("/VERSION = \x27([^\x27]+)/", $s, $m);
+            $v = $m[1] ?? "?";
+            echo "Composer embutido: $v\n";
+            if (version_compare($v, "2.10.0", "<")) {
+              fwrite(STDERR, "::error::Composer embutido $v < 2.10.0\n");
+              exit(1);
+            }
+          ' "$PWD/builds/s3-satis.phar"
 
       - name: Upload a Build Artifact
         uses: actions/upload-artifact@v4
@@ -65,9 +90,3 @@ jobs:
           path: builds/*
           if-no-files-found: error
           retention-days: 30
-
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        if:   startsWith(github.ref, 'refs/tags/')
-        with:
-          files: builds/s3-satis.phar

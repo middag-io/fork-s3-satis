@@ -16,11 +16,11 @@
         }
     ],
     "require": {
-        "php": "^8.2",
-        "composer/satis": "3.0.x-dev",
-        "laravel-zero/framework": "^10.3",
+        "php": "^8.4",
+        "composer/satis": "dev-main",
+        "laravel-zero/framework": "^12.1",
         "league/flysystem-aws-s3-v3": "^3.22",
-        "nunomaduro/termwind": "^1.15.1",
+        "nunomaduro/termwind": "^2.0",
         "olvlvl/composer-attribute-collector": "^2.0.1"
     },
     "require-dev": {
