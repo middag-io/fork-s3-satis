@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM php:8.2-cli AS builder
+FROM --platform=$BUILDPLATFORM php:8.4-cli AS builder
 
 ARG BUILD_VERSION=docker
 
@@ -14,14 +14,14 @@ RUN php -v
 COPY . /usr/src/satis
 WORKDIR /usr/src/satis
 
-ENV COMPOSER_ALLOW_SUPERUSER 1
+ENV COMPOSER_ALLOW_SUPERUSER=1
 
 RUN composer install --no-interaction --no-progress --no-scripts --optimize-autoloader --no-dev --ignore-platform-req=ext-zip
 
 RUN ./s3-satis app:build --build-version=${BUILD_VERSION} --ansi -vvv
 
 
-FROM php:8.2-cli AS runtime
+FROM php:8.4-cli AS runtime
 
 RUN apt-get update \
 	&& apt-get -y install libzip-dev git unzip \
