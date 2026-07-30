@@ -4,7 +4,14 @@
 >
 > Fork de [`kduma-OSS/CLI-s3-satis`](https://github.com/kduma-OSS/CLI-s3-satis). Upstream continua sendo a referência para uso e configuração; abaixo só o que muda aqui.
 >
-> **Por que o fork existe.** O Composer valida `config.github-oauth` contra um charset que **não inclui hífen**, e aborta o build inteiro se o token não casar. Installation tokens de GitHub App vêm com hífen, então o build morria na primeira linha — e como o satis roda com `--skip-errors`, o job saía **verde** sem regenerar um único arquivo de metadata, congelando o índice em silêncio. A validação foi **removida no Composer 2.10.0** (a 2.9.8 ainda a tinha). Este fork existe para carregar Composer >= 2.10.
+> **Por que o fork existe.** Dois motivos, e vale não confundi-los, porque a condição para largar o fork depende do segundo:
+>
+> 1. **Composer >= 2.10.** O Composer validava `config.github-oauth` contra um charset que **não inclui hífen** e abortava o build inteiro se o token não casasse. Installation tokens de GitHub App vêm com hífen, então o build morria na primeira linha — e como o satis roda com `--skip-errors`, o job saía **verde** sem regenerar um único arquivo de metadata, congelando o índice em silêncio. A validação foi **removida no Composer 2.10.0** (a 2.9.8 ainda a tinha).
+> 2. **Deps modernizadas** que o upstream não subiu: `composer/satis` 3 → 4 (`dev-main`), `laravel-zero/framework` 10 → 12, PHP 8.2 → 8.4.
+>
+> **Sobre o formato do token — não reinvestigue.** O installation token vem com **383 bytes e contém hífen**, longe do `ghs_` + 36 que a [documentação de formato de token de 2021](https://github.blog/changelog/2021-03-04-authentication-token-format-updates/) descreve. Isso é mudança **deliberada e permanente** do GitHub, implementada em 2026 — não é bug, não é o código lendo o campo errado, e não há nada a reportar. Quem vir `383 bytes` no log do `inspect-satisfile-auth.php` do `infra-privatesatis` já tem a resposta aqui.
+>
+> **Condição de saída.** O gatilho para reavaliar o fork é o **upstream subir as deps** (item 2), não o GitHub voltar atrás no formato do token: o formato é permanente, e o lado do Composer já está resolvido em qualquer versão >= 2.10. Enquanto `kduma-OSS/CLI-s3-satis` seguir em satis 3 / laravel-zero 10, o fork continua necessário. Vale lembrar que um fork já era o status quo antes deste (`michaelmeneses/CLI-s3-satis`); o que mudou foi passar para a org e modernizar.
 >
 > Cadeia que isso obriga: `composer/satis` `dev-main` → `composer/composer ^2.10.1` + `php ^8.4`, e o `symfony/console ^7.4.13` dele exige `laravel-zero/framework ^12.1` e `nunomaduro/termwind ^2.0`.
 >
