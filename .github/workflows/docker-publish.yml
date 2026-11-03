@@ -10,8 +10,24 @@ on:
     branches: [ "master", "develop" ]
     # Publish semver tags as releases.
     tags: [ 'v*.*.*' ]
+    # Publish only when the image can change: a branch push whose every path is
+    # in this list (license, root Markdown, repository metadata) is skipped.
+    # Any other path, this workflow included, publishes. Path filters are not
+    # evaluated for tag pushes, so tags always publish.
+    paths-ignore:
+      - "LICENSE*"
+      - "NOTICE"
+      - "*.md"
+      - "docs/**"
+      - ".claude/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/CODEOWNERS"
+      - ".github/dependabot.yml"
+      - "CODEOWNERS"
   pull_request:
     branches: [ "master", "develop" ]
+  # Manual publish of the selected branch; never filtered.
+  workflow_dispatch:
 
 env:
   # Use docker.io for Docker Hub if empty
