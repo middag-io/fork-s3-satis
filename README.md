@@ -4,6 +4,8 @@
 >
 > Fork de [`kduma-OSS/CLI-s3-satis`](https://github.com/kduma-OSS/CLI-s3-satis). Upstream continua sendo a referência para uso e configuração; abaixo só o que muda aqui.
 >
+> **Licença.** MIT, a do upstream (`composer.json` `license: MIT`). O [`LICENSE`](LICENSE) traz o texto MIT e o aviso de copyright do autor original, que a MIT exige em toda cópia; o PHAR também leva o arquivo.
+>
 > **Por que o fork existe.** Dois motivos, e vale não confundi-los, porque a condição para largar o fork depende do segundo:
 >
 > 1. **Composer >= 2.10.** O Composer validava `config.github-oauth` contra um charset que **não inclui hífen** e abortava o build inteiro se o token não casasse. Installation tokens de GitHub App vêm com hífen, então o build morria na primeira linha — e como o satis roda com `--skip-errors`, o job saía **verde** sem regenerar um único arquivo de metadata, congelando o índice em silêncio. A validação foi **removida no Composer 2.10.0** (a 2.9.8 ainda a tinha).
